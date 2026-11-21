@@ -1,0 +1,7 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+plan.json
+infracost.json
+__pycache__/

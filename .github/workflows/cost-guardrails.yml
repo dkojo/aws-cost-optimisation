@@ -1,0 +1,95 @@
+name: cost-guardrails
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # OIDC sign-in to AWS, no stored keys
+  pull-requests: write   # post the cost estimate on the PR
+
+concurrency:
+  group: cost-guardrails-${{ github.ref }}
+
+env:
+  BUDGET_USD: 20
+  AWS_REGION: us-east-1
+  PLAN_ROLE: arn:aws:iam::870342665742:role/github-cost-guardrails-plan
+  APPLY_ROLE: arn:aws:iam::870342665742:role/github-cost-guardrails-apply
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform format and validate
+        run: |
+          terraform fmt -check -recursive infra
+          for dir in infra/workload infra/guardrails; do
+            terraform -chdir=$dir init -backend=false -input=false >/dev/null
+            terraform -chdir=$dir validate
+          done
+
+      - name: Sign in to AWS with OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.PLAN_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform plan
+        run: |
+          terraform -chdir=infra/workload init -input=false >/dev/null
+          terraform -chdir=infra/workload plan -input=false -out=tfplan
+          terraform -chdir=infra/workload show -json tfplan > plan.json
+          terraform -chdir=infra/guardrails init -input=false -reconfigure >/dev/null
+          terraform -chdir=infra/guardrails plan -input=false -lock=false -var monthly_budget_usd=$BUDGET_USD
+
+      - name: Set up Infracost
+        uses: infracost/actions/setup@a5783eb98adc93aa7a0049fce0abb06fdd30770a # v5.0.1
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Cost estimate
+        run: |
+          infracost breakdown --path infra/workload --format json --out-file infracost.json
+          infracost output --path infracost.json --format table
+
+      - name: Post cost estimate on the PR
+        if: github.event_name == 'pull_request'
+        run: |
+          infracost comment github --path infracost.json --repo $GITHUB_REPOSITORY \
+            --github-token ${{ github.token }} --pull-request ${{ github.event.pull_request.number }} --behavior update
+
+      - name: Cost tag check
+        run: python3 policy/check.py tags plan.json
+
+      - name: Rightsizing check
+        run: python3 policy/check.py rightsizing plan.json
+
+      - name: Availability check
+        run: python3 policy/check.py availability plan.json
+
+      - name: Budget gate
+        run: python3 policy/check.py budget infracost.json $BUDGET_USD
+
+      # Only main changes anything in AWS, and only the budget and alerts
+      - name: Sign in to AWS to apply
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.APPLY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Apply budget and anomaly alerts
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: terraform -chdir=infra/guardrails apply -input=false -auto-approve -var monthly_budget_usd=$BUDGET_USD
