@@ -61,7 +61,7 @@ resource "aws_security_group" "web" {
 resource "aws_launch_template" "web" {
   name          = "web"
   image_id      = "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
-  instance_type = "t4g.micro"
+  instance_type = "m5.2xlarge"
 
   vpc_security_group_ids = [aws_security_group.web.id]
 
